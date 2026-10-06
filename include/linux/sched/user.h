@@ -22,8 +22,12 @@ struct user_struct {
 	atomic_long_t epoll_watches; /* The number of file descriptors currently watched */
 #endif
 #ifdef CONFIG_POSIX_MQUEUE
-	/* protected by mq_lock	*/
-	unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
+	/*
+	 * Droidspaces: mq_bytes lives in the Android kABI padding at the end
+	 * of user_struct instead (see ANDROID_KABI_USE below).  Keeping it
+	 * here would shift the fields that follow and change the genksyms
+	 * CRCs of exported symbols that reach user_struct.
+	 */
 #endif
 	unsigned long locked_shm; /* How many pages of mlocked shm ? */
 	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
@@ -41,8 +45,20 @@ struct user_struct {
 	/* Miscellaneous per-user rate limit */
 	struct ratelimit_state ratelimit;
 
+	/*
+	 * Droidspaces: CONFIG_POSIX_MQUEUE normally adds mq_bytes in the
+	 * middle of user_struct.  Put it in the Android kABI padding instead
+	 * so the option does not move a single byte of the structure.  For
+	 * __GENKSYMS__ this slot is still plain android_kabi_reserved1
+	 * padding, exactly like the stock (CONFIG_POSIX_MQUEUE=n) kernel.
+	 */
+#if defined(CONFIG_POSIX_MQUEUE)
+	ANDROID_KABI_USE(1, unsigned long mq_bytes);
+	ANDROID_KABI_RESERVE(2);
+#else
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
+#endif
 };
 
 extern int uids_sysfs_init(void);
