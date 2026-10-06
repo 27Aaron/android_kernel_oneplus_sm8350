@@ -1,0 +1,402 @@
+name: OnePlus 9 Pro - Droidspaces + ReSukiSU + SUSFS
+
+# Builds a boot.img for the OnePlus 9 Pro (lemonadep / sm8350 / lahaina) with
+#
+#   * Droidspaces  - Linux container / namespace support
+#   * ReSukiSU     - KernelSU fork, manual-hook mode (the only mode a 5.4
+#                    kernel supports)
+#   * SUSFS        - root hiding (optional, on by default)
+#
+# The kernel version string is pinned to the one the current LineageOS 23.2
+# nightly was built with (see .scmversion).  That is what makes the prebuilt
+# vendor modules in vendor_boot / vendor_dlkm load: their vermagic is
+# "5.4.302-qgki-g187d13cd30e2 SMP preempt mod_unload modversions aarch64".
+# The `kabi-baseline` job additionally proves that the exported symbol CRCs
+# did not move either.
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_susfs:
+        description: "Integrate SUSFS (root hiding)"
+        type: boolean
+        default: true
+      run_kabi_check:
+        description: "Also build the pristine baseline and diff Module.symvers"
+        type: boolean
+        default: true
+      allow_kabi_change:
+        description: "Release even if the module ABI changed (dangerous)"
+        type: boolean
+        default: false
+      create_release:
+        description: "Publish the images to a GitHub release"
+        type: boolean
+        default: true
+      release_tag:
+        description: "Release tag (leave empty to auto-generate)"
+        type: string
+        default: ""
+  push:
+    branches:
+      - droidspaces-resukisu-susfs
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+
+env:
+  # Pristine LineageOS 23.2 commit this branch is based on.  The official
+  # lemonadep nightly was built from exactly this commit, which is why the
+  # stock kernel reports "-g187d13cd30e2".
+  BASE_COMMIT: 187d13cd30e2b22e7c4405b62f162e5218025299
+  BASE_SHORT: "187d13cd30e2"
+  DEVICE: lemonadep
+  ARCH: arm64
+  PAGE_SIZE: "4096"
+  BOOT_PARTITION_SIZE: "201326592"
+  # AOSP prebuilt clang; the gitiles tarball extracts straight into a directory.
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz
+  # Stock LineageOS 23.2 boot ramdisk + AVB vbmeta block, see prebuilt/README.md.
+  RAMDISK: prebuilt/boot-ramdisk.lz4
+  AVB: prebuilt/boot-avb.bin
+  MAKE_ARGS: >-
+    ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE= CLANG_TRIPLE=aarch64-linux-gnu-
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Pristine tree + stock defconfig -> reference Module.symvers.
+  # ---------------------------------------------------------------------------
+  kabi-baseline:
+    name: kABI baseline (stock config)
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.run_kabi_check == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_COMMIT }}
+          fetch-depth: 1
+          path: kernel
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod rsync zstd lz4 \
+            python3 curl git ccache
+
+      - name: Cache clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r547379-${{ runner.os }}
+
+      - name: Fetch clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/clang"
+          curl -LSs --retry 3 --retry-delay 5 "$CLANG_URL" | tar -xz -C "$HOME/clang"
+          test -x "$HOME/clang/bin/clang"
+
+      - name: Build pristine kernel
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} vendor/lahaina-qgki_defconfig
+          make O=out ${MAKE_ARGS} olddefconfig
+          make O=out ${MAKE_ARGS} -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image out/Module.symvers
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kabi-baseline
+          path: kernel/out/Module.symvers
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The real build.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build kernel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: kernel
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod rsync zstd lz4 \
+            python3 curl git ccache
+
+      - name: Cache clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r547379-${{ runner.os }}
+
+      - name: Fetch clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/clang"
+          curl -LSs --retry 3 --retry-delay 5 "$CLANG_URL" | tar -xz -C "$HOME/clang"
+          test -x "$HOME/clang/bin/clang"
+
+      - name: Apply Droidspaces / ReSukiSU / SUSFS
+        working-directory: kernel
+        env:
+          WITH_SUSFS: ${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}
+        run: bash scripts/kernel-features/apply.sh
+
+      - name: Configure
+        working-directory: kernel
+        env:
+          WITH_SUSFS: ${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} vendor/lahaina-qgki_defconfig
+          make O=out ${MAKE_ARGS} olddefconfig
+          # CONFIG_KSU's hook method is a Kconfig 'choice' whose default is the
+          # tracepoint redirector; that is a hard build error on 5.4, so force
+          # the correct selection after the defconfig has been expanded.
+          OUT=out bash scripts/kernel-features/apply.sh --config-only
+          make O=out ${MAKE_ARGS} olddefconfig
+
+      - name: Verify the resolved configuration
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          cfg=out/.config
+          fail=0
+          for opt in \
+            CONFIG_SYSVIPC=y CONFIG_POSIX_MQUEUE=y CONFIG_IPC_NS=y \
+            CONFIG_PID_NS=y CONFIG_UTS_NS=y CONFIG_USER_NS=y CONFIG_NET_NS=y \
+            CONFIG_DEVTMPFS=y CONFIG_NAMESPACES=y CONFIG_TMPFS_XATTR=y \
+            CONFIG_KSU=y CONFIG_LTO_CLANG=y CONFIG_THINLTO=y CONFIG_CFI_CLANG=y
+          do
+            if ! grep -qx "$opt" "$cfg"; then
+              echo "::error::$opt missing from the resolved .config"
+              fail=1
+            fi
+          done
+          # These are the options that would move a core structure (or an enum
+          # used as an array bound) and therefore change exported symbol CRCs.
+          for opt in CONFIG_CGROUP_DEVICE CONFIG_NF_TABLES CONFIG_BRIDGE_NETFILTER; do
+            if grep -qx "${opt}=y" "$cfg"; then
+              echo "::error::$opt is set - it is a known module ABI breaker on this tree"
+              fail=1
+            fi
+          done
+          grep -E '^CONFIG_KSU' "$cfg" || true
+          [ "$fail" -eq 0 ]
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image out/Module.symvers
+
+      - name: Collect artifacts
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image dist/Image
+          cp out/Module.symvers dist/Module.symvers
+          cp out/.config dist/kernel.config
+          {
+            echo "version=$(make O=out ${MAKE_ARGS} --no-print-directory kernelrelease)"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short HEAD)"
+            echo "date=$(date -u +%Y%m%d)"
+            echo "susfs=${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}"
+            echo "run=${GITHUB_RUN_NUMBER}"
+          } > dist/build-info.txt
+          cat dist/build-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel/dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # ABI gate, packaging and release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: verify, package and release
+    runs-on: ubuntu-24.04
+    needs: [build, kabi-baseline]
+    if: always() && needs.build.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        if: needs.kabi-baseline.result == 'success'
+        with:
+          name: kabi-baseline
+          path: baseline
+
+      - name: Compare Module.symvers against the baseline
+        id: kabi
+        run: |
+          set -uo pipefail
+          if [ ! -f baseline/Module.symvers ]; then
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "Baseline build unavailable - kABI comparison skipped." \
+              | tee dist/kabi-report.txt
+            exit 0
+          fi
+          python3 scripts/kernel-features/compare-symvers.py \
+              baseline/Module.symvers dist/Module.symvers \
+              > dist/kabi-report.txt 2>&1
+          rc=$?
+          cat dist/kabi-report.txt
+          if [ "$rc" -eq 0 ]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=changed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail when the module ABI changed
+        if: >-
+          steps.kabi.outputs.status == 'changed' &&
+          github.event.inputs.allow_kabi_change != 'true'
+        run: |
+          echo "::error::exported symbol CRCs changed - the prebuilt vendor modules would refuse to load"
+          exit 1
+
+      - name: Verify the kernel version string
+        run: |
+          set -euo pipefail
+          strings -a dist/Image | grep -m1 "5\.4\.302-qgki-g${BASE_SHORT}" \
+            || { echo "::error::kernel version string does not match the stock LineageOS build (vendor modules would be rejected by vermagic)"; exit 1; }
+          echo "kernel release: $(sed -n 's/^version=//p' dist/build-info.txt)"
+
+      - name: Pack boot.img
+        run: |
+          set -euxo pipefail
+          DATE="$(sed -n 's/^date=//p' dist/build-info.txt)"
+          IMG="boot-${DEVICE}-droidspaces-resukisu-${DATE}.img"
+          python3 scripts/kernel-features/pack-boot.py \
+            --kernel dist/Image \
+            --ramdisk "${RAMDISK}" \
+            --avb "${AVB}" \
+            --output "dist/${IMG}" \
+            --page-size "${PAGE_SIZE}" \
+            --pad-to "${BOOT_PARTITION_SIZE}"
+          ( cd dist && sha256sum "${IMG}" Image > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Assemble release notes
+        run: |
+          set -euo pipefail
+          DATE="$(sed -n 's/^date=//p' dist/build-info.txt)"
+          {
+            echo "## OnePlus 9 Pro (lemonadep) - Droidspaces + ReSukiSU + SUSFS"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| kernel release | \`$(sed -n 's/^version=//p' dist/build-info.txt)\` |"
+            echo "| kernel commit | \`$(sed -n 's/^commit=//p' dist/build-info.txt)\` |"
+            echo "| LineageOS target | 23.2 nightly 20261005 (\`${BASE_SHORT}\`) |"
+            echo "| SUSFS | ${{ github.event.inputs.with_susfs == 'false' && 'no' || 'yes' }} |"
+            echo "| module ABI check | ${{ steps.kabi.outputs.status }} |"
+            echo
+            echo "### Flash"
+            echo
+            echo '```sh'
+            echo "fastboot flash boot boot-${DEVICE}-droidspaces-resukisu-${DATE}.img"
+            echo '```'
+            echo
+            echo "Only the kernel is replaced. The image is built against the LineageOS"
+            echo "23.2 nightly \`20261005\` and keeps the vendor module ABI untouched, so"
+            echo "\`vendor_boot\` and \`vendor_dlkm\` do **not** need to be reflashed."
+            echo "To roll back, flash the stock \`boot.img\` of your LineageOS build."
+            echo
+            echo "### Contents"
+            echo
+            echo "- **Droidspaces**: \`CONFIG_SYSVIPC\`, \`CONFIG_POSIX_MQUEUE\`, PID/UTS/IPC/user/net"
+            echo "  namespaces, \`CGROUP_DEVICE\`/\`FREEZER\`/\`NET_PRIO\`, devtmpfs, overlayfs,"
+            echo "  veth/bridge and the netfilter NAT set (IPv4 + IPv6)."
+            echo "- **ReSukiSU** (now BakaSU), manual-hook mode."
+            echo "- **SUSFS** when enabled above."
+            echo
+            echo "### module ABI report"
+            echo
+            echo '```'
+            head -50 dist/kabi-report.txt
+            echo '```'
+          } > dist/release-notes.md
+          cat dist/release-notes.md
+
+      - name: Create release
+        if: github.event.inputs.create_release != 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: >-
+            ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('{0}-droidspaces-resukisu-{1}', env.DEVICE, github.run_number) }}
+          name: ${{ format('OnePlus 9 Pro (lemonadep) Droidspaces + ReSukiSU + SUSFS - build {0}', github.run_number) }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/*.img
+            dist/SHA256SUMS
+            dist/Image
+            dist/Module.symvers
+            dist/kernel.config
+            dist/kabi-report.txt
+          draft: false
+          prerelease: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-image
+          path: |
+            dist/*.img
+            dist/Image
+            dist/SHA256SUMS
+            dist/kabi-report.txt

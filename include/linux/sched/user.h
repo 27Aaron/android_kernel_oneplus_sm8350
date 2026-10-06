@@ -23,7 +23,15 @@ struct user_struct {
 #endif
 #ifdef CONFIG_POSIX_MQUEUE
 	/* protected by mq_lock	*/
-	unsigned long mq_bytes;	/* How many bytes can be allocated to mqueue? */
+	/*
+	 * Droidspaces: mq_bytes is moved into the Android kABI padding at the
+	 * end of the structure (see below).  Keeping it here would shift
+	 * locked_shm/uidhash_node/ratelimit and change the genksyms CRCs of
+	 * every exported symbol that references struct user_struct, so the
+	 * prebuilt vendor modules (built with CONFIG_POSIX_MQUEUE=n) would
+	 * refuse to load.
+	 */
+	/* unsigned long mq_bytes; */	/* How many bytes can be allocated to mqueue? */
 #endif
 	unsigned long locked_shm; /* How many pages of mlocked shm ? */
 	unsigned long unix_inflight;	/* How many files in flight in unix sockets */
@@ -41,8 +49,21 @@ struct user_struct {
 	/* Miscellaneous per-user rate limit */
 	struct ratelimit_state ratelimit;
 
+	/*
+	 * Droidspaces: CONFIG_POSIX_MQUEUE normally adds mq_bytes in the
+	 * middle of user_struct.  Put it in the Android kABI padding instead,
+	 * so that enabling the option does not move a single byte of the
+	 * structure.  For __GENKSYMS__ this slot is still seen as plain
+	 * android_kabi_reserved1 padding, exactly like the stock
+	 * (CONFIG_POSIX_MQUEUE=n) kernel.
+	 */
+#if defined(CONFIG_POSIX_MQUEUE)
+	ANDROID_KABI_USE(1, unsigned long mq_bytes);
+	ANDROID_KABI_RESERVE(2);
+#else
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
+#endif
 };
 
 extern int uids_sysfs_init(void);

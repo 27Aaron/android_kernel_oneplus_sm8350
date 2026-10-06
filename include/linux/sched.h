@@ -1088,8 +1088,16 @@ struct task_struct {
 	struct nameidata		*nameidata;
 
 #ifdef CONFIG_SYSVIPC
-	struct sysv_sem			sysvsem;
-	struct sysv_shm			sysvshm;
+	/*
+	 * Droidspaces: sysvsem/sysvshm are moved into the Android kABI
+	 * padding at the end of task_struct (see the ANDROID_KABI_USE(1, ...)
+	 * block further down).  Keeping them here would shift every field
+	 * that follows, changing the genksyms CRCs of thousands of exported
+	 * symbols, so the prebuilt vendor modules in vendor_boot/vendor_dlkm
+	 * (which were built with CONFIG_SYSVIPC=n) would refuse to load.
+	 */
+	/* struct sysv_sem			sysvsem; */
+	/* struct sysv_shm			sysvshm; */
 #endif
 #ifdef CONFIG_DETECT_HUNG_TASK
 	/* hung task detection */
@@ -1474,9 +1482,25 @@ struct task_struct {
 
 	ANDROID_VENDOR_DATA_ARRAY(1, 3);
 
+	/*
+	 * Droidspaces: CONFIG_SYSVIPC normally adds sysvsem/sysvshm in the
+	 * middle of task_struct (see above).  Put them in the Android kABI
+	 * padding instead, so that enabling CONFIG_SYSVIPC does not move a
+	 * single byte of the structure and the kernel ABI stays compatible
+	 * with the prebuilt vendor modules in vendor_boot / vendor_dlkm.
+	 *
+	 * For __GENKSYMS__ these slots are still seen as plain
+	 * android_kabi_reservedN padding, which is exactly what the stock
+	 * (CONFIG_SYSVIPC=n) kernel exports.
+	 */
+#ifdef CONFIG_SYSVIPC
+	ANDROID_KABI_USE(1, struct sysv_sem sysvsem);
+	_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(2); ANDROID_KABI_RESERVE(3), struct sysv_shm sysvshm);
+#else
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
+#endif
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
