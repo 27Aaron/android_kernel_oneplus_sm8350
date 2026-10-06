@@ -103,10 +103,28 @@ tmpdir="$(mktemp -d)"
 #   * insert 'source "drivers/kernelsu/Kconfig"' into drivers/Kconfig
 # NOTE: KernelSU-Next/.git has to survive - the driver Kbuild reads it for the
 # version string and hard-errors without it.
+wire_driver() {
+	# what setup.sh does after cloning, minus the network
+	ln -sf "$(realpath --relative-to=drivers KernelSU-Next/kernel)" drivers/kernelsu
+	grep -q 'kernelsu' drivers/Makefile \
+		|| printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+	grep -q 'kernelsu/Kconfig' drivers/Kconfig \
+		|| sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+}
+
 if [[ -d KernelSU-Next/.git || -e drivers/kernelsu ]]; then
-	log "KernelSU-Next driver already present, skipping setup.sh"
+	log "KernelSU-Next driver already present, skipping the install step"
+elif [[ -n "${KSU_PREBUILT_DIR:-}" && -d "${KSU_PREBUILT_DIR}/.git" ]]; then
+	# Preferred path: a clone made ahead of time.  github.com is not always
+	# reachable from the build container, and a failed clone there costs a
+	# whole build cycle.
+	log "Installing KernelSU-Next from the pre-cloned copy at $KSU_PREBUILT_DIR"
+	cp -a "$KSU_PREBUILT_DIR" KernelSU-Next || die "could not copy the pre-cloned driver"
+	git -C KernelSU-Next checkout -q "$KSU_BRANCH" 2>/dev/null \
+		|| warn "could not check out $KSU_BRANCH, using whatever HEAD is"
+	wire_driver
 else
-	log "Installing KernelSU-Next ($KSU_BRANCH)"
+	log "Installing KernelSU-Next ($KSU_BRANCH) over the network"
 	fetch "$KSU_SETUP_URL" "$tmpdir/setup.sh"
 	bash "$tmpdir/setup.sh" "$KSU_BRANCH" || die "KernelSU-Next setup.sh failed"
 fi
