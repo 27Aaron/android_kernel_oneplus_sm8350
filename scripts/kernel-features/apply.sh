@@ -176,6 +176,35 @@ for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
 done
 
 # ---------------------------------------------------------------------------
+# 4b. make sure fs/stat.c can actually see the SUSFS constants
+# ---------------------------------------------------------------------------
+# The 5.4 backport patches the body of fs/stat.c to use STATX_SUS_KSTAT and
+# STATX_SUS_KSTAT_FUSE, and adds a block of extern declarations, but on this
+# tree it does not add the include that defines those constants.  Add it
+# ourselves, already wrapped in the __GENKSYMS__ guard used below.
+log "Checking that fs/stat.c can see the SUSFS constants"
+if ! grep -q 'linux/susfs_def.h' fs/stat.c; then
+	python3 - <<'PY'
+import io, re, sys
+path = "fs/stat.c"
+src = io.open(path, encoding="utf-8").read()
+anchor = "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nextern bool susfs_is_inode_sus_kstat"
+if anchor not in src:
+    sys.exit("fs/stat.c: cannot find the SUSFS extern block to anchor on")
+block = (
+    "#if defined(CONFIG_KSU_SUSFS) && !defined(__GENKSYMS__)\n"
+    "#include <linux/susfs_def.h>\n"
+    "#endif\n\n"
+)
+src = src.replace(anchor, block + anchor, 1)
+io.open(path, "w", encoding="utf-8").write(src)
+print("  inserted the guarded susfs_def.h include into fs/stat.c")
+PY
+else
+	echo "  fs/stat.c already includes susfs_def.h"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. genksyms view (module ABI)
 # ---------------------------------------------------------------------------
 # The SUSFS hook patches pull fs/mount.h into fs/stat.c and fs/statfs.c, which
