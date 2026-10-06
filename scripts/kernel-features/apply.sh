@@ -176,6 +176,24 @@ for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
 done
 
 # ---------------------------------------------------------------------------
+# 4a. export susfs_run_sus_path_loop()
+# ---------------------------------------------------------------------------
+# The community 5.4 backport defines this as static, but the KernelSU-Next
+# driver calls it from another translation unit (hook/setuid_hook.c), so the
+# link fails with "undefined symbol: susfs_run_sus_path_loop".  The upstream
+# tree this configuration is modelled on drops the static keyword and nothing
+# else - the header is byte-identical between the two - so do the same.
+log "Exporting susfs_run_sus_path_loop() for the KernelSU-Next driver"
+if grep -q '^static void susfs_run_sus_path_loop(void)' fs/susfs.c; then
+	sed -i 's|^static void susfs_run_sus_path_loop(void)|void susfs_run_sus_path_loop(void)|' fs/susfs.c
+	echo "  dropped the static keyword in fs/susfs.c"
+elif grep -q '^void susfs_run_sus_path_loop(void)' fs/susfs.c; then
+	echo "  already exported"
+else
+	die "fs/susfs.c: cannot find susfs_run_sus_path_loop to export"
+fi
+
+# ---------------------------------------------------------------------------
 # 4b. make sure fs/stat.c can actually see the SUSFS constants
 # ---------------------------------------------------------------------------
 # The 5.4 backport patches the body of fs/stat.c to use STATX_SUS_KSTAT and
