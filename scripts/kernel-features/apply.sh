@@ -176,6 +176,78 @@ for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
 done
 
 # ---------------------------------------------------------------------------
+# 3b. backport path_umount()
+# ---------------------------------------------------------------------------
+# KernelSU uses path_umount() to unmount the module overlay from the app
+# process (feature/kernel_umount.c).  It only exists in kernels after 5.4, so
+# it has to be backported; the driver declares it extern itself, so nothing
+# outside fs/namespace.c needs to change.  can_umount() is the other half of
+# the same upstream commit and is not in this tree either.
+log "Backporting path_umount() for the KernelSU umount feature"
+if grep -q '^int path_umount(struct path \*path, int flags)' fs/namespace.c; then
+	echo "  already present"
+else
+	python3 - <<'PY'
+import io, sys
+
+path = "fs/namespace.c"
+src = io.open(path, encoding="utf-8").read()
+
+anchor = """SYSCALL_DEFINE1(oldumount, char __user *, name)
+{
+\treturn ksys_umount(name, 0);
+}
+
+#endif
+"""
+if anchor not in src:
+    sys.exit("fs/namespace.c: cannot find the oldumount block to anchor on")
+
+can_umount = """static int can_umount(const struct path *path, int flags)
+{
+\tstruct mount *mnt = real_mount(path->mnt);
+
+\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+\t\treturn -EINVAL;
+\tif (!may_mount())
+\t\treturn -EPERM;
+\tif (path->dentry != path->mnt->mnt_root)
+\t\treturn -EINVAL;
+\tif (!check_mnt(mnt))
+\t\treturn -EINVAL;
+\tif (mnt->mnt.mnt_flags & MNT_LOCKED)
+\t\treturn -EINVAL;
+\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+\t\treturn -EPERM;
+\treturn 0;
+}
+
+int path_umount(struct path *path, int flags)
+{
+\tstruct mount *mnt = real_mount(path->mnt);
+\tint ret;
+
+\tret = can_umount(path, flags);
+\tif (!ret)
+\t\tret = do_umount(mnt, flags);
+
+\t/* we mustn't call path_put() as that would clear mnt_expiry_mark */
+\tdput(path->dentry);
+\tmntput_no_expire(mnt);
+\treturn ret;
+}
+"""
+
+src = src.replace(anchor, anchor + "\n" + can_umount, 1)
+io.open(path, "w", encoding="utf-8").write(src)
+print("  inserted can_umount() and path_umount() into fs/namespace.c")
+PY
+fi
+
+grep -q '^int path_umount(struct path \*path, int flags)' fs/namespace.c \
+	|| die "path_umount backport did not land"
+
+# ---------------------------------------------------------------------------
 # 4a. export susfs_run_sus_path_loop()
 # ---------------------------------------------------------------------------
 # The community 5.4 backport defines this as static, but the KernelSU-Next
