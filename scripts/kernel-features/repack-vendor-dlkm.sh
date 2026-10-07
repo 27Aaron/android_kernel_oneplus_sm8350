@@ -106,7 +106,7 @@ mkfs.erofs \
 	--mount-point=/vendor_dlkm \
 	--all-root \
 	--file-contexts="$CTX" \
-	-zlz4 -b4096 -T1230768000 \
+	-zlz4hc,12 -b4096 -T1230768000 \
 	"$OUT_IMG" "$ROOT" >/dev/null
 
 BASE_SIZE=$(stat -c %s "$BASE_IMG")
