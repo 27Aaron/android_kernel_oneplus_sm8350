@@ -1,0 +1,510 @@
+name: OnePlus 9 Pro - Droidspaces + KernelSU-Next + SUSFS
+
+# Builds the kernel + vendor_dlkm for the OnePlus 9 Pro (lemonadep / sm8350 /
+# lahaina) with
+#
+#   * Droidspaces  - Linux container / namespace support
+#   * KernelSU-Next - manual-hook mode (the only hook mode a 5.4 kernel
+#                    supports), from the legacy-susfs branch which carries
+#                    the SUSFS integration
+#   * SUSFS        - root hiding (optional, on by default)
+#
+# Two images are produced and BOTH have to be flashed, in this order:
+#
+#   1. vendor_dlkm.img - the ROM's vendor_dlkm base with every .ko replaced by
+#      the modules built here.  Flash it while the stock kernel is still in
+#      place (fastbootd needs a bootable boot image).
+#   2. boot.img - the new kernel + the ROM's stock ramdisk + stock AVB block.
+#
+# Why both: the ROM (Project Infinity-X 3.12) was built from its own kernel
+# fork, not from this tree.  2852 of the 5169 symbol CRCs its vendor modules
+# import differ from ours, so each side refuses the other's modules
+# ("disagrees about version of symbol").  Booting the new kernel with the old
+# modules crashes the boot chain into XBL ramdump mode.
+#
+# The kernel release string is still pinned by .scmversion to the ROM's
+# "-gb0634b416a64-dirty" so that nothing else on the device notices a version
+# change.  Two gates keep that honest:
+#   * `kabi-baseline` (pristine tree, same base commit, stock defconfig) proves
+#     our patches did not move any exported symbol CRC
+#   * the version-string assertion below proves vermagic still matches
+# The ROM's own modules are compared too, but informationally: the divergence
+# is expected and is exactly why we ship our own modules.
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_susfs:
+        description: "Integrate SUSFS (root hiding)"
+        type: boolean
+        default: true
+      run_kabi_check:
+        description: "Also build the pristine baseline and diff Module.symvers"
+        type: boolean
+        default: true
+      allow_kabi_change:
+        description: "Release even if the module ABI changed (dangerous)"
+        type: boolean
+        default: false
+      create_release:
+        description: "Publish the images to a GitHub release"
+        type: boolean
+        default: true
+      release_tag:
+        description: "Release tag (leave empty to auto-generate)"
+        type: string
+        default: ""
+      rom_zip_url:
+        description: "ROM zip used as the vendor_dlkm base (defaults to the Infinity-X 3.12 package)"
+        type: string
+        default: ""
+  push:
+    branches:
+      - droidspaces-ksun
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+
+env:
+  # Pristine LineageOS 23.2 commit this branch is based on; the kabi-baseline
+  # job rebuilds this exact commit with the stock defconfig as the ABI
+  # reference.
+  BASE_COMMIT: 187d13cd30e2b22e7c4405b62f162e5218025299
+  BASE_SHORT: "187d13cd30e2"
+  # Kernel release the ROM's kernel and vendor modules were built with
+  # (Project Infinity-X 3.12, 06.07.2026).  .scmversion pins ours to it.
+  KERNEL_RELEASE: "5.4.302-qgki-gb0634b416a64-dirty"
+  # boot.img header field of the stock image, see prebuilt/README.md
+  OS_VERSION: "0x200001a7"
+  DEVICE: lemonadep
+  ARCH: arm64
+  PAGE_SIZE: "4096"
+  BOOT_PARTITION_SIZE: "201326592"
+  # AOSP prebuilt clang, tag-pinned and matching the toolchain the ROM's own
+  # kernel was built with (r563880 = LLVM 21, see /proc/version of the stock
+  # kernel).  The gitiles tarball extracts straight into a directory.
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-16.0.0_r4/clang-r563880.tar.gz
+  # Stock LineageOS 23.2 boot ramdisk + AVB vbmeta block, see prebuilt/README.md.
+  RAMDISK: prebuilt/boot-ramdisk.lz4
+  AVB: prebuilt/boot-avb.bin
+  MAKE_ARGS: >-
+    ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE= CLANG_TRIPLE=aarch64-linux-gnu-
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Pristine tree + stock defconfig -> reference Module.symvers.
+  # ---------------------------------------------------------------------------
+  kabi-baseline:
+    name: kABI baseline (stock config)
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'push' ||
+      github.event.inputs.run_kabi_check == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_COMMIT }}
+          fetch-depth: 1
+          path: kernel
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod rsync zstd lz4 \
+            python3 curl git ccache
+
+      - name: Cache clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r547379-${{ runner.os }}
+
+      - name: Fetch clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/clang"
+          curl -LSs --retry 3 --retry-delay 5 "$CLANG_URL" | tar -xz -C "$HOME/clang"
+          test -x "$HOME/clang/bin/clang"
+
+      - name: Build pristine kernel
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} vendor/lahaina-qgki_defconfig
+          make O=out ${MAKE_ARGS} olddefconfig
+          make O=out ${MAKE_ARGS} -j"$(nproc)" Image
+          ls -la out/arch/arm64/boot/Image out/Module.symvers
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kabi-baseline
+          path: kernel/out/Module.symvers
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The real build.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build kernel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: kernel
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio kmod rsync zstd lz4 \
+            python3 curl git ccache
+
+      - name: Cache clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r547379-${{ runner.os }}
+
+      - name: Fetch clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/clang"
+          curl -LSs --retry 3 --retry-delay 5 "$CLANG_URL" | tar -xz -C "$HOME/clang"
+          test -x "$HOME/clang/bin/clang"
+
+      - name: Pre-clone the KernelSU-Next driver
+        # github.com is not always reachable from inside the build container,
+        # and a failed clone there costs a whole build cycle.  apply.sh picks
+        # the clone up through KSU_PREBUILT_DIR and only falls back to the
+        # network when it is missing.
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch legacy-susfs \
+            https://github.com/Gamesmes90/KernelSU-Next.git \
+            "$HOME/KernelSU-Next-prebuilt"
+          git -C "$HOME/KernelSU-Next-prebuilt" log --oneline -1
+
+      - name: Apply Droidspaces / KernelSU-Next / SUSFS
+        working-directory: kernel
+        env:
+          WITH_SUSFS: ${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}
+          KSU_PREBUILT_DIR: /home/runner/KernelSU-Next-prebuilt
+        run: bash scripts/kernel-features/apply.sh
+
+      - name: Configure
+        working-directory: kernel
+        env:
+          WITH_SUSFS: ${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} vendor/lahaina-qgki_defconfig
+          make O=out ${MAKE_ARGS} olddefconfig
+          # CONFIG_KSU's hook method is a Kconfig 'choice' whose default is the
+          # tracepoint redirector; that is a hard build error on 5.4, so force
+          # the correct selection after the defconfig has been expanded.
+          OUT=out bash scripts/kernel-features/apply.sh --config-only
+          make O=out ${MAKE_ARGS} olddefconfig
+
+      - name: Verify the resolved configuration
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          cfg=out/.config
+          fail=0
+          for opt in \
+            CONFIG_SYSVIPC=y CONFIG_POSIX_MQUEUE=y CONFIG_IPC_NS=y \
+            CONFIG_PID_NS=y CONFIG_UTS_NS=y CONFIG_USER_NS=y CONFIG_NET_NS=y \
+            CONFIG_DEVTMPFS=y CONFIG_NAMESPACES=y CONFIG_TMPFS_XATTR=y \
+            CONFIG_KSU=y CONFIG_LTO_CLANG=y CONFIG_THINLTO=y CONFIG_CFI_CLANG=y
+          do
+            if ! grep -qx "$opt" "$cfg"; then
+              echo "::error::$opt missing from the resolved .config"
+              fail=1
+            fi
+          done
+          # These are the options that would move a core structure (or an enum
+          # used as an array bound) and therefore change exported symbol CRCs.
+          for opt in CONFIG_CGROUP_DEVICE CONFIG_NF_TABLES CONFIG_BRIDGE_NETFILTER; do
+            if grep -qx "${opt}=y" "$cfg"; then
+              echo "::error::$opt is set - it is a known module ABI breaker on this tree"
+              fail=1
+            fi
+          done
+          grep -E '^CONFIG_KSU' "$cfg" || true
+          [ "$fail" -eq 0 ]
+
+      - name: Build kernel and modules
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ${MAKE_ARGS} -j"$(nproc)" Image modules
+          make O=out ${MAKE_ARGS} INSTALL_MOD_PATH=out/modinst INSTALL_MOD_STRIP=1 modules_install
+          ls -la out/arch/arm64/boot/Image out/Module.symvers
+          echo "built modules: $(find out/modinst -name '*.ko' | wc -l)"
+
+      - name: Collect artifacts
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image dist/Image
+          cp out/Module.symvers dist/Module.symvers
+          cp out/.config dist/kernel.config
+          {
+            echo "version=$(make O=out ${MAKE_ARGS} --no-print-directory kernelrelease)"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short HEAD)"
+            echo "date=$(date -u +%Y%m%d)"
+            echo "susfs=${{ github.event.inputs.with_susfs == 'false' && '0' || '1' }}"
+            echo "run=${GITHUB_RUN_NUMBER}"
+          } > dist/build-info.txt
+          cat dist/build-info.txt
+
+      - name: Build vendor_dlkm.img (our modules over the ROM's base)
+        working-directory: kernel
+        env:
+          # The ROM's vendor_dlkm is used as the base image so that
+          # etc/build.prop, fs_config and modules.blocklist stay exactly as the
+          # ROM ships them; only the .ko files are replaced.
+          ROM_ZIP_URL: ${{ github.event.inputs.rom_zip_url != '' && github.event.inputs.rom_zip_url || 'https://sourceforge.net/projects/infinity-x/files/lemonadep/16/gapps/Project_Infinity-X-3.12-lemonadep-06.07.2026-GAPPS-OFFICIAL.zip/download' }}
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y --no-install-recommends erofs-utils unzip
+          mkdir -p /tmp/rom && cd /tmp/rom
+          curl -LSsL --retry 3 --retry-delay 5 -o rom.zip "$ROM_ZIP_URL"
+          unzip -o rom.zip payload.bin >/dev/null
+          curl -LSs --retry 3 -o pdg.tar.gz \
+            https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz
+          tar -xzf pdg.tar.gz payload-dumper-go
+          ./payload-dumper-go -partitions vendor_dlkm -o out payload.bin
+          cd "$GITHUB_WORKSPACE/kernel"
+          scripts/kernel-features/repack-vendor-dlkm.sh \
+            /tmp/rom/out/vendor_dlkm.img \
+            out/modinst \
+            dist/vendor_dlkm.img \
+            "${KERNEL_RELEASE}"
+          ( cd dist && sha256sum Image vendor_dlkm.img > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: kernel/dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # ABI gate, packaging and release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: verify, package and release
+    runs-on: ubuntu-24.04
+    needs: [build, kabi-baseline]
+    if: always() && needs.build.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        if: needs.kabi-baseline.result == 'success'
+        with:
+          name: kabi-baseline
+          path: baseline
+
+      - name: Compare Module.symvers against the baseline
+        id: kabi
+        run: |
+          set -uo pipefail
+          if [ ! -f baseline/Module.symvers ]; then
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "Baseline build unavailable - kABI comparison skipped." \
+              | tee dist/kabi-report.txt
+            exit 0
+          fi
+          python3 scripts/kernel-features/compare-symvers.py \
+              baseline/Module.symvers dist/Module.symvers \
+              > dist/kabi-report.txt 2>&1
+          rc=$?
+          cat dist/kabi-report.txt
+          if [ "$rc" -eq 0 ]; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=changed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail when the module ABI changed
+        if: >-
+          steps.kabi.outputs.status == 'changed' &&
+          github.event.inputs.allow_kabi_change != 'true'
+        run: |
+          echo "::error::exported symbol CRCs changed - the prebuilt vendor modules would refuse to load"
+          exit 1
+
+      - name: Compare against the ROM's own vendor modules (informational)
+        # The ROM's kernel tree has diverged from LineageOS, so its prebuilt
+        # modules do NOT match this kernel and are replaced by the ones we
+        # build here (see the vendor_dlkm step below).  The report is kept as
+        # evidence of why reusing them is not an option.
+        run: |
+          set -uo pipefail
+          python3 scripts/kernel-features/compare-symvers.py \
+              prebuilt/infinityx-vendor-modules.symvers dist/Module.symvers \
+              > dist/rom-modules-report.txt 2>&1 || true
+          head -20 dist/rom-modules-report.txt
+
+      - name: Verify the kernel version string
+        run: |
+          set -euo pipefail
+          got="$(sed -n 's/^version=//p' dist/build-info.txt)"
+          [ "$got" = "${KERNEL_RELEASE}" ] \
+            || { echo "::error::kernel release is '$got', expected '${KERNEL_RELEASE}' - the vendor modules would be rejected by vermagic"; exit 1; }
+          strings -a dist/Image | grep -m1 -- "${KERNEL_RELEASE}" \
+            || { echo "::error::kernel release string not found in the built Image"; exit 1; }
+          echo "kernel release: $got"
+
+      - name: Pack boot.img
+        run: |
+          set -euxo pipefail
+          DATE="$(sed -n 's/^date=//p' dist/build-info.txt)"
+          IMG="boot-${DEVICE}-droidspaces-ksun-${DATE}.img"
+          test -s dist/vendor_dlkm.img || {
+            echo "::error::vendor_dlkm.img was not produced by the build job"; exit 1; }
+          python3 scripts/kernel-features/pack-boot.py \
+            --kernel dist/Image \
+            --ramdisk "${RAMDISK}" \
+            --avb "${AVB}" \
+            --output "dist/${IMG}" \
+            --page-size "${PAGE_SIZE}" \
+            --os-version "${OS_VERSION}" \
+            --pad-to "${BOOT_PARTITION_SIZE}"
+          ( cd dist && sha256sum "${IMG}" vendor_dlkm.img Image > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Assemble release notes
+        run: |
+          set -euo pipefail
+          DATE="$(sed -n 's/^date=//p' dist/build-info.txt)"
+          {
+            echo "## OnePlus 9 Pro (lemonadep) - Droidspaces + KernelSU-Next + SUSFS"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| kernel release | \`${KERNEL_RELEASE}\` |"
+            echo "| kernel commit | \`$(sed -n 's/^commit=//p' dist/build-info.txt)\` |"
+            echo "| ROM target | Project Infinity-X 3.12 lemonadep 06.07.2026 |"
+            echo "| SUSFS | ${{ github.event.inputs.with_susfs == 'false' && 'no' || 'yes' }} |"
+            echo "| module ABI vs pristine baseline | ${{ steps.kabi.outputs.status }} |"
+            echo
+            echo "### Flash (two images, order matters)"
+            echo
+            echo '```sh'
+            echo "# 1. with the STOCK kernel still in place, enter fastbootd and replace the modules"
+            echo "fastboot reboot fastboot"
+            echo "fastboot flash vendor_dlkm vendor_dlkm.img"
+            echo "fastboot reboot bootloader"
+            echo "# 2. now replace the kernel"
+            echo "fastboot flash boot boot-${DEVICE}-droidspaces-ksun-${DATE}.img"
+            echo "fastboot reboot"
+            echo '```'
+            echo
+            echo "Both partitions have to be flashed. The ROM's kernel tree has diverged"
+            echo "from LineageOS (2852 of 5169 imported symbol CRCs differ), so the ROM's"
+            echo "prebuilt modules are refused by this kernel - and this kernel's modules by"
+            echo "the ROM's kernel. Never boot one without the other: running the new kernel"
+            echo "with the old modules (which is what \`fastboot reboot fastboot\` used to do"
+            echo "while only \`boot\` had been flashed) crashes the boot chain into XBL"
+            echo "ramdump mode."
+            echo
+            echo "To roll back, flash the ROM's stock \`boot\` and \`vendor_dlkm\` again (or"
+            echo "sideload the ROM zip), or just switch slots: \`fastboot --set-active=a\`"
+            echo "and \`fastboot --set-active=b\`."
+            echo
+            echo "### Contents"
+            echo
+            echo "- **Droidspaces**: \`CONFIG_SYSVIPC\`, \`CONFIG_POSIX_MQUEUE\`, PID/UTS/IPC/user/net"
+            echo "  namespaces, devtmpfs, overlayfs, tmpfs xattr/acl, veth/bridge, the netfilter"
+            echo "  NAT set (IPv4 + IPv6) and \`CONFIG_MEMCG\` for \`--memory\`."
+            echo "  \`CONFIG_CGROUP_DEVICE\`, \`CONFIG_CGROUP_PIDS\`, \`CONFIG_CFS_BANDWIDTH\`,"
+            echo "  \`CONFIG_NF_TABLES\` and \`CONFIG_BRIDGE_NETFILTER\` stay off: they move core"
+            echo "  structures or an enum used as an array bound, and the Droidspaces"
+            echo "  documentation rules them out."
+            echo "- **KernelSU-Next** (legacy-susfs branch, manual hook mode) and **SUSFS**"
+            echo "  (5.4 backport), both pinned by commit in \`scripts/kernel-features/apply.sh\`."
+            echo "- Kernel release string pinned with \`.scmversion\` to the ROM's own"
+            echo "  \`${KERNEL_RELEASE}\`."
+            echo
+            echo "### module ABI report (vs a pristine tree at \`${BASE_SHORT}\`)"
+            echo
+            echo '```'
+            head -30 dist/kabi-report.txt
+            echo '```'
+          } > dist/release-notes.md
+          cat dist/release-notes.md
+
+      - name: Create release
+        if: github.event.inputs.create_release != 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: >-
+            ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('{0}-droidspaces-ksun-{1}', env.DEVICE, github.run_number) }}
+          name: ${{ format('OnePlus 9 Pro (lemonadep) Droidspaces + KernelSU-Next + SUSFS - build {0}', github.run_number) }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/*.img
+            dist/SHA256SUMS
+            dist/Image
+            dist/Module.symvers
+            dist/kernel.config
+            dist/kabi-report.txt
+            dist/rom-modules-report.txt
+          draft: false
+          prerelease: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-image
+          path: |
+            dist/*.img
+            dist/Image
+            dist/SHA256SUMS
+            dist/kabi-report.txt
+            dist/rom-modules-report.txt
