@@ -175,9 +175,64 @@ why the modules travel with the kernel.
 
 ## Known limitations
 
+### 1. The kernel does not boot the recovery / fastbootd path
+
+`adb reboot sideload`, `fastboot reboot fastboot` and recovery boots all end in
+the XBL ramdump screen.  Normal boots are unaffected, and so are root, SUSFS
+and Droidspaces.  Consequences:
+
+* `adb sideload` of a ROM zip requires the ROM's stock `boot` to be flashed
+  back first — the recovery path works fine with the stock kernel, and recovery
+  does not care which modules live in `vendor_dlkm`.
+* Logical partitions can only be written from fastbootd, which therefore also
+  needs the stock `boot` in place.
+* OTA updates started from the running system (update_engine writing the
+  inactive slot) are not affected.
+
+### 2. `fastboot --set-active` leaves this device in an inconsistent state
+
+On this device `fastboot --set-active=<slot>` updates the bootloader's slot
+variable but **not** the super partition's metadata slot.  Booting the other
+slot then pairs that slot's `boot` (physical, per slot) with the *current*
+metadata slot's logical partitions (`system`, `vendor`, `vendor_dlkm`, ...).
+
+Observed twice on 2026-10-07: with the custom `vendor_dlkm` on slot A,
+`fastboot --set-active=b` + boot → the stock kernel from `boot_b` was paired
+with A's custom modules → boot chain crashed into XBL ramdump.
+
+Evidence, from fastbootd with `current-slot: b`:
+
+```
+partition-size:vendor_dlkm      FAILED (remote: 'Could not open partition')
+partition-size:vendor_dlkm_a    0xD09000        <- the custom image's size
+partition-size:vendor_dlkm_b    FAILED (remote: 'Could not open partition')
+```
+
+Only the OTA path (`update_engine` + `boot_control`, e.g. `adb sideload` of the
+full ROM zip) switches the metadata slot together with the boot slot; that is
+why slot B booted fine right after an OTA and crashes after a fastboot slot
+switch.
+
+Practical consequences:
+
+* A custom kernel cannot be installed on the second slot: its logical
+  partitions are unreachable from fastbootd, and flashing only `boot` would mix
+  builds.
+* Treat the slot the ROM currently boots from as *the* slot, and use re-flashing
+  the ROM zip (then re-applying `boot` + `vendor_dlkm`) as the recovery path —
+  not `fastboot --set-active`.
+* To move to the other slot deliberately, use the ROM's own OTA updater.
+
+### 3. Droidspaces resource limits
+
 * `--cpus` / `--pids-limit` unavailable (`CFS_BANDWIDTH`, `CGROUP_PIDS` off).
-* Droidspaces' requirements screen reports `cgroup device` as unmet
-  (`CGROUP_DEVICE` off); containers still start, matching the community
-  Droidspaces kernels for sm8350 which also leave it off.
-* After any ROM update (which rewrites `boot` and `vendor_dlkm`), the kernel
-  and modules have to be re-flashed.
+* `CONFIG_CGROUP_DEVICE` is off as well: Droidspaces' documentation table calls
+  it required, but Droidspaces 6.6.0's own check reports
+  `[✓] All required features found!` on this kernel, and the community sm8350
+  Droidspaces kernels leave it off too.  `--memory` works (`CONFIG_MEMCG=y`).
+
+### 4. ROM updates
+
+Any ROM update rewrites `boot` and `vendor_dlkm` for the updated slot, so the
+kernel and its modules have to be re-flashed afterwards, in the order described
+above (modules first, then kernel).
