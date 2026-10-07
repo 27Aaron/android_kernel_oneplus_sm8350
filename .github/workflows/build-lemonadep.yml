@@ -271,9 +271,12 @@ jobs:
           set -euxo pipefail
           export PATH="$HOME/clang/bin:$PATH"
           make O=out ${MAKE_ARGS} -j"$(nproc)" Image modules
-          make O=out ${MAKE_ARGS} INSTALL_MOD_PATH=out/modinst INSTALL_MOD_STRIP=1 modules_install
+          # NOTE: INSTALL_MOD_PATH must be absolute.  With O=out a relative
+          # path is resolved against the output directory, which silently
+          # installs into out/out/modinst.
+          make O=out ${MAKE_ARGS} INSTALL_MOD_PATH="$PWD/out/modinst" INSTALL_MOD_STRIP=1 modules_install
           ls -la out/arch/arm64/boot/Image out/Module.symvers
-          echo "built modules: $(find out/modinst -name '*.ko' | wc -l)"
+          echo "built modules: $(find "$PWD/out/modinst" -name '*.ko' | wc -l)"
 
       - name: Collect artifacts
         working-directory: kernel
